@@ -16,12 +16,28 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false } // wichtig für Supabase
 });
 
+// Tabelle anlegen, falls nicht vorhanden
+(async () => {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS entries (
+      id SERIAL PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      date DATE NOT NULL,
+      score INTEGER NOT NULL CHECK(score BETWEEN 1 AND 100),
+      text TEXT DEFAULT ''
+    );
+  `);
+
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_entries_date ON entries(date);`);
+})();
+
 // ---------- Helpers ----------
 const isoDateSchema = z.string().regex(/^\d{4}-\d{2}-\d{2}$/);
 const entrySchema = z.object({
   score: z.number().int().min(1).max(100),
   text: z.string().max(1000).optional().default(""),
-  date: isoDateSchema.optional()
+  date: isoDateSchema.optional(),
+  user_id: z.string().min(1)
 });
 
 function todayLocalISODate() {
@@ -38,14 +54,15 @@ app.post("/entries", async (req, res, next) => {
     const parsed = entrySchema.parse({
       score: Number(req.body.score),
       text: req.body.text ?? "",
-      date: req.body.date
+      date: req.body.date,
+      user_id: req.body.user_id
     });
 
     const date = parsed.date || todayLocalISODate();
 
     const result = await pool.query(
-      `INSERT INTO entries (date, score, text) VALUES ($1, $2, $3) RETURNING *`,
-      [date, parsed.score, parsed.text]
+      `INSERT INTO entries (user_id, date, score, text) VALUES ($1, $2, $3, $4) RETURNING *`,
+      [parsed.user_id, date, parsed.score, parsed.text]
     );
 
     res.json(result.rows[0]);
@@ -54,17 +71,19 @@ app.post("/entries", async (req, res, next) => {
   }
 });
 
-// Einträge holen
+// Einträge holen (optional mit Filter)
 app.get("/entries", async (req, res, next) => {
   try {
-    const { from, to, limit } = req.query;
+    const { from, to, limit, user_id } = req.query;
+    if (!user_id) return res.status(400).json({ error: "user_id ist erforderlich" });
 
-    const where = [];
-    const params = [];
-    if (from) { isoDateSchema.parse(from); where.push(`date >= $${where.length + 1}`); params.push(from); }
-    if (to)   { isoDateSchema.parse(to);   where.push(`date <= $${where.length + 1}`); params.push(to);   }
+    const where = ["user_id = $1"];
+    const params = [user_id];
 
-    const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
+    if (from) { isoDateSchema.parse(from); where.push(`date >= $${params.length + 1}`); params.push(from); }
+    if (to)   { isoDateSchema.parse(to);   where.push(`date <= $${params.length + 1}`); params.push(to);   }
+
+    const whereSql = `WHERE ${where.join(" AND ")}`;
     const lim = Math.min(Number(limit) || 365, 1000);
 
     const result = await pool.query(
@@ -78,16 +97,22 @@ app.get("/entries", async (req, res, next) => {
   }
 });
 
-// Stats
-app.get("/stats", async (_req, res, next) => {
+// Stats (nur für den Nutzer)
+app.get("/stats", async (req, res, next) => {
   try {
-    const result = await pool.query(`
-      SELECT COUNT(*) as count,
-             ROUND(AVG(score), 1) as avg,
-             MIN(score) as min,
-             MAX(score) as max
-      FROM entries
-    `);
+    const { user_id } = req.query;
+    if (!user_id) return res.status(400).json({ error: "user_id ist erforderlich" });
+
+    const result = await pool.query(
+      `SELECT COUNT(*) as count,
+              ROUND(AVG(score), 1) as avg,
+              MIN(score) as min,
+              MAX(score) as max
+       FROM entries
+       WHERE user_id = $1`,
+      [user_id]
+    );
+
     res.json(result.rows[0]);
   } catch (err) {
     next(err);
@@ -108,6 +133,7 @@ app.put("/entries/:id", async (req, res, next) => {
 
     const fields = [];
     const params = [];
+
     if (payload.score !== undefined) { z.number().int().min(1).max(100).parse(payload.score); fields.push(`score = $${fields.length + 1}`); params.push(payload.score); }
     if (payload.text !== undefined)  { z.string().max(1000).parse(payload.text); fields.push(`text = $${fields.length + 1}`); params.push(payload.text); }
     if (payload.date !== undefined)  { isoDateSchema.parse(payload.date); fields.push(`date = $${fields.length + 1}`); params.push(payload.date); }
