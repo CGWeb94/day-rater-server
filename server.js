@@ -3,6 +3,7 @@ import express from "express";
 import cors from "cors";
 import pkg from "pg";
 import { z } from "zod";
+import fetch from "node-fetch";
 
 const { Pool } = pkg;
 
@@ -21,7 +22,7 @@ const pool = new Pool({
   await pool.query(`
     CREATE TABLE IF NOT EXISTS entries (
       id SERIAL PRIMARY KEY,
-      user_id TEXT NOT NULL,
+      user_id UUID NOT NULL,
       date DATE NOT NULL,
       score INTEGER NOT NULL CHECK(score BETWEEN 1 AND 100),
       text TEXT DEFAULT ''
@@ -36,8 +37,7 @@ const isoDateSchema = z.string().regex(/^\d{4}-\d{2}-\d{2}$/);
 const entrySchema = z.object({
   score: z.number().int().min(1).max(100),
   text: z.string().max(1000).optional().default(""),
-  date: isoDateSchema.optional(),
-  user_id: z.string().min(1)
+  date: isoDateSchema.optional()
 });
 
 function todayLocalISODate() {
@@ -46,23 +46,38 @@ function todayLocalISODate() {
   return new Date(now.getTime() - offMs).toISOString().slice(0, 10);
 }
 
+// ---------- Auth Helper ----------
+async function getUserIdFromToken(req) {
+  const authHeader = req.headers.authorization;
+  if (!authHeader?.startsWith("Bearer ")) throw new Error("Missing token");
+  const token = authHeader.split(" ")[1];
+
+  // Supabase Auth API
+  const res = await fetch(`${process.env.VITE_SUPABASE_URL}/auth/v1/user`, {
+    headers: { Authorization: `Bearer ${token}` }
+  });
+  if (!res.ok) throw new Error("Invalid token");
+  const data = await res.json();
+  return data.id; // user_id
+}
+
 // ---------- Routes ----------
 
 // Eintrag anlegen
 app.post("/entries", async (req, res, next) => {
   try {
+    const user_id = await getUserIdFromToken(req);
     const parsed = entrySchema.parse({
       score: Number(req.body.score),
       text: req.body.text ?? "",
-      date: req.body.date,
-      user_id: req.body.user_id
+      date: req.body.date
     });
 
     const date = parsed.date || todayLocalISODate();
 
     const result = await pool.query(
       `INSERT INTO entries (user_id, date, score, text) VALUES ($1, $2, $3, $4) RETURNING *`,
-      [parsed.user_id, date, parsed.score, parsed.text]
+      [user_id, date, parsed.score, parsed.text]
     );
 
     res.json(result.rows[0]);
@@ -71,11 +86,11 @@ app.post("/entries", async (req, res, next) => {
   }
 });
 
-// Einträge holen (optional mit Filter)
+// Einträge holen
 app.get("/entries", async (req, res, next) => {
   try {
-    const { from, to, limit, user_id } = req.query;
-    if (!user_id) return res.status(400).json({ error: "user_id ist erforderlich" });
+    const user_id = await getUserIdFromToken(req);
+    const { from, to, limit } = req.query;
 
     const where = ["user_id = $1"];
     const params = [user_id];
@@ -97,11 +112,10 @@ app.get("/entries", async (req, res, next) => {
   }
 });
 
-// Stats (nur für den Nutzer)
+// Stats
 app.get("/stats", async (req, res, next) => {
   try {
-    const { user_id } = req.query;
-    if (!user_id) return res.status(400).json({ error: "user_id ist erforderlich" });
+    const user_id = await getUserIdFromToken(req);
 
     const result = await pool.query(
       `SELECT COUNT(*) as count,
@@ -122,6 +136,7 @@ app.get("/stats", async (req, res, next) => {
 // Eintrag ändern
 app.put("/entries/:id", async (req, res, next) => {
   try {
+    const user_id = await getUserIdFromToken(req);
     const id = Number(req.params.id);
     if (!Number.isInteger(id)) throw new Error("Invalid id");
 
@@ -140,9 +155,9 @@ app.put("/entries/:id", async (req, res, next) => {
 
     if (!fields.length) return res.status(400).json({ error: "No fields to update" });
 
-    params.push(id);
+    params.push(id, user_id);
     const result = await pool.query(
-      `UPDATE entries SET ${fields.join(", ")} WHERE id = $${fields.length + 1} RETURNING *`,
+      `UPDATE entries SET ${fields.join(", ")} WHERE id = $${fields.length + 1} AND user_id = $${fields.length + 2} RETURNING *`,
       params
     );
 
@@ -155,8 +170,9 @@ app.put("/entries/:id", async (req, res, next) => {
 // Eintrag löschen
 app.delete("/entries/:id", async (req, res, next) => {
   try {
+    const user_id = await getUserIdFromToken(req);
     const id = Number(req.params.id);
-    await pool.query(`DELETE FROM entries WHERE id = $1`, [id]);
+    await pool.query(`DELETE FROM entries WHERE id = $1 AND user_id = $2`, [id, user_id]);
     res.json({ success: true });
   } catch (err) {
     next(err);
