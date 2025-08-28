@@ -3,7 +3,7 @@ import express from "express";
 import cors from "cors";
 import pkg from "pg";
 import { z } from "zod";
-import fetch from "node-fetch";
+import { createClient } from "@supabase/supabase-js";
 
 const { Pool } = pkg;
 
@@ -11,10 +11,16 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// ---------- Supabase Client (für Auth) ----------
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY // Service Role Key, um JWT zu prüfen
+);
+
 // ---------- DB ----------
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false } // wichtig für Supabase
+  ssl: { rejectUnauthorized: false }
 });
 
 // Tabelle anlegen, falls nicht vorhanden
@@ -22,13 +28,12 @@ const pool = new Pool({
   await pool.query(`
     CREATE TABLE IF NOT EXISTS entries (
       id SERIAL PRIMARY KEY,
-      user_id UUID NOT NULL,
+      user_id TEXT NOT NULL,
       date DATE NOT NULL,
       score INTEGER NOT NULL CHECK(score BETWEEN 1 AND 100),
       text TEXT DEFAULT ''
     );
   `);
-
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_entries_date ON entries(date);`);
 })();
 
@@ -46,27 +51,31 @@ function todayLocalISODate() {
   return new Date(now.getTime() - offMs).toISOString().slice(0, 10);
 }
 
-// ---------- Auth Helper ----------
-async function getUserIdFromToken(req) {
-  const authHeader = req.headers.authorization;
-  if (!authHeader?.startsWith("Bearer ")) throw new Error("Missing token");
-  const token = authHeader.split(" ")[1];
+// Middleware: JWT prüfen und user_id setzen
+async function authenticate(req, res, next) {
+  try {
+    const authHeader = req.headers.authorization;
+    if (!authHeader) return res.status(401).json({ error: "Authorization Header fehlt" });
 
-  // Supabase Auth API
-  const res = await fetch(`${process.env.VITE_SUPABASE_URL}/auth/v1/user`, {
-    headers: { Authorization: `Bearer ${token}` }
-  });
-  if (!res.ok) throw new Error("Invalid token");
-  const data = await res.json();
-  return data.id; // user_id
+    const token = authHeader.split(" ")[1];
+    if (!token) return res.status(401).json({ error: "Token fehlt" });
+
+    const { data: { user }, error } = await supabase.auth.getUser(token);
+    if (error || !user) return res.status(401).json({ error: "Ungültiger Token" });
+
+    req.user_id = user.id;
+    next();
+  } catch (err) {
+    console.error(err);
+    res.status(401).json({ error: "Auth Fehler" });
+  }
 }
 
 // ---------- Routes ----------
 
 // Eintrag anlegen
-app.post("/entries", async (req, res, next) => {
+app.post("/entries", authenticate, async (req, res, next) => {
   try {
-    const user_id = await getUserIdFromToken(req);
     const parsed = entrySchema.parse({
       score: Number(req.body.score),
       text: req.body.text ?? "",
@@ -77,7 +86,7 @@ app.post("/entries", async (req, res, next) => {
 
     const result = await pool.query(
       `INSERT INTO entries (user_id, date, score, text) VALUES ($1, $2, $3, $4) RETURNING *`,
-      [user_id, date, parsed.score, parsed.text]
+      [req.user_id, date, parsed.score, parsed.text]
     );
 
     res.json(result.rows[0]);
@@ -86,14 +95,13 @@ app.post("/entries", async (req, res, next) => {
   }
 });
 
-// Einträge holen
-app.get("/entries", async (req, res, next) => {
+// Einträge holen (optional mit Filter)
+app.get("/entries", authenticate, async (req, res, next) => {
   try {
-    const user_id = await getUserIdFromToken(req);
     const { from, to, limit } = req.query;
 
     const where = ["user_id = $1"];
-    const params = [user_id];
+    const params = [req.user_id];
 
     if (from) { isoDateSchema.parse(from); where.push(`date >= $${params.length + 1}`); params.push(from); }
     if (to)   { isoDateSchema.parse(to);   where.push(`date <= $${params.length + 1}`); params.push(to);   }
@@ -113,10 +121,8 @@ app.get("/entries", async (req, res, next) => {
 });
 
 // Stats
-app.get("/stats", async (req, res, next) => {
+app.get("/stats", authenticate, async (req, res, next) => {
   try {
-    const user_id = await getUserIdFromToken(req);
-
     const result = await pool.query(
       `SELECT COUNT(*) as count,
               ROUND(AVG(score), 1) as avg,
@@ -124,7 +130,7 @@ app.get("/stats", async (req, res, next) => {
               MAX(score) as max
        FROM entries
        WHERE user_id = $1`,
-      [user_id]
+      [req.user_id]
     );
 
     res.json(result.rows[0]);
@@ -134,9 +140,8 @@ app.get("/stats", async (req, res, next) => {
 });
 
 // Eintrag ändern
-app.put("/entries/:id", async (req, res, next) => {
+app.put("/entries/:id", authenticate, async (req, res, next) => {
   try {
-    const user_id = await getUserIdFromToken(req);
     const id = Number(req.params.id);
     if (!Number.isInteger(id)) throw new Error("Invalid id");
 
@@ -155,10 +160,10 @@ app.put("/entries/:id", async (req, res, next) => {
 
     if (!fields.length) return res.status(400).json({ error: "No fields to update" });
 
-    params.push(id, user_id);
+    params.push(id);
     const result = await pool.query(
       `UPDATE entries SET ${fields.join(", ")} WHERE id = $${fields.length + 1} AND user_id = $${fields.length + 2} RETURNING *`,
-      params
+      [...params, req.user_id]
     );
 
     res.json(result.rows[0]);
@@ -168,11 +173,10 @@ app.put("/entries/:id", async (req, res, next) => {
 });
 
 // Eintrag löschen
-app.delete("/entries/:id", async (req, res, next) => {
+app.delete("/entries/:id", authenticate, async (req, res, next) => {
   try {
-    const user_id = await getUserIdFromToken(req);
     const id = Number(req.params.id);
-    await pool.query(`DELETE FROM entries WHERE id = $1 AND user_id = $2`, [id, user_id]);
+    await pool.query(`DELETE FROM entries WHERE id = $1 AND user_id = $2`, [id, req.user_id]);
     res.json({ success: true });
   } catch (err) {
     next(err);
