@@ -31,7 +31,8 @@ const pool = new Pool({
       user_id TEXT NOT NULL,
       date DATE NOT NULL,
       score INTEGER NOT NULL CHECK(score BETWEEN 1 AND 100),
-      text TEXT DEFAULT ''
+      text TEXT DEFAULT '',
+      color TEXT
     );
   `);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_entries_date ON entries(date);`);
@@ -42,7 +43,8 @@ const isoDateSchema = z.string().regex(/^\d{4}-\d{2}-\d{2}$/);
 const entrySchema = z.object({
   score: z.number().int().min(1).max(100),
   text: z.string().max(1000).optional().default(""),
-  date: isoDateSchema.optional()
+  date: isoDateSchema.optional(),
+  color: z.string().optional()
 });
 
 function todayLocalISODate() {
@@ -79,14 +81,15 @@ app.post("/entries", authenticate, async (req, res, next) => {
     const parsed = entrySchema.parse({
       score: Number(req.body.score),
       text: req.body.text ?? "",
-      date: req.body.date
+      date: req.body.date,
+      color: req.body.color
     });
 
     const date = parsed.date || todayLocalISODate();
 
     const result = await pool.query(
-      `INSERT INTO entries (user_id, date, score, text) VALUES ($1, $2, $3, $4) RETURNING *`,
-      [req.user_id, date, parsed.score, parsed.text]
+      `INSERT INTO entries (user_id, date, score, text, color) VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+      [req.user_id, date, parsed.score, parsed.text, parsed.color]
     );
 
     res.json(result.rows[0]);
@@ -148,7 +151,8 @@ app.put("/entries/:id", authenticate, async (req, res, next) => {
     const payload = {
       score: req.body.score !== undefined ? Number(req.body.score) : undefined,
       text: req.body.text,
-      date: req.body.date
+      date: req.body.date,
+      color: req.body.color
     };
 
     const fields = [];
@@ -157,6 +161,7 @@ app.put("/entries/:id", authenticate, async (req, res, next) => {
     if (payload.score !== undefined) { z.number().int().min(1).max(100).parse(payload.score); fields.push(`score = $${fields.length + 1}`); params.push(payload.score); }
     if (payload.text !== undefined)  { z.string().max(1000).parse(payload.text); fields.push(`text = $${fields.length + 1}`); params.push(payload.text); }
     if (payload.date !== undefined)  { isoDateSchema.parse(payload.date); fields.push(`date = $${fields.length + 1}`); params.push(payload.date); }
+    if (payload.color !== undefined) { z.string().parse(payload.color); fields.push(`color = $${fields.length + 1}`); params.push(payload.color); }
 
     if (!fields.length) return res.status(400).json({ error: "No fields to update" });
 
