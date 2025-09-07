@@ -41,7 +41,9 @@ const pool = new Pool({
 const isoDateSchema = z.string().regex(/^\d{4}-\d{2}-\d{2}$/);
 const entrySchema = z.object({
   score: z.number().int().min(1).max(100),
-  text: z.string().max(1000).optional().default(""),
+  text: z.string().max(1000),
+  iv: z.string().max(24),          // IV wird Base64 gespeichert
+  badge: z.string().max(50).optional(),
   date: isoDateSchema.optional()
 });
 
@@ -78,15 +80,18 @@ app.post("/entries", authenticate, async (req, res, next) => {
   try {
     const parsed = entrySchema.parse({
       score: Number(req.body.score),
-      text: req.body.text ?? "",
+      text: req.body.text,
+      iv: req.body.iv,
+      badge: req.body.badge,
       date: req.body.date
     });
 
     const date = parsed.date || todayLocalISODate();
 
     const result = await pool.query(
-      `INSERT INTO entries (user_id, date, score, text) VALUES ($1, $2, $3, $4) RETURNING *`,
-      [req.user_id, date, parsed.score, parsed.text]
+      `INSERT INTO entries (user_id, date, score, text, iv, badge)
+       VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+      [req.user_id, date, parsed.score, parsed.text, parsed.iv, parsed.badge || null]
     );
 
     res.json(result.rows[0]);
@@ -148,6 +153,8 @@ app.put("/entries/:id", authenticate, async (req, res, next) => {
     const payload = {
       score: req.body.score !== undefined ? Number(req.body.score) : undefined,
       text: req.body.text,
+      iv: req.body.iv,
+      badge: req.body.badge,
       date: req.body.date
     };
 
@@ -157,6 +164,8 @@ app.put("/entries/:id", authenticate, async (req, res, next) => {
     if (payload.score !== undefined) { z.number().int().min(1).max(100).parse(payload.score); fields.push(`score = $${fields.length + 1}`); params.push(payload.score); }
     if (payload.text !== undefined)  { z.string().max(1000).parse(payload.text); fields.push(`text = $${fields.length + 1}`); params.push(payload.text); }
     if (payload.date !== undefined)  { isoDateSchema.parse(payload.date); fields.push(`date = $${fields.length + 1}`); params.push(payload.date); }
+    if (payload.iv !== undefined)   { z.string().max(24).parse(payload.iv); fields.push(`iv = $${fields.length + 1}`); params.push(payload.iv); }
+    if (payload.badge !== undefined){ z.string().max(50).parse(payload.badge); fields.push(`badge = $${fields.length + 1}`); params.push(payload.badge); }
 
     if (!fields.length) return res.status(400).json({ error: "No fields to update" });
 
@@ -171,6 +180,9 @@ app.put("/entries/:id", authenticate, async (req, res, next) => {
     next(err);
   }
 });
+
+
+
 
 // Eintrag löschen
 app.delete("/entries/:id", authenticate, async (req, res, next) => {
