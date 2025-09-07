@@ -1,4 +1,3 @@
-// server/server.js
 import express from "express";
 import cors from "cors";
 import pkg from "pg";
@@ -31,7 +30,10 @@ const pool = new Pool({
       user_id TEXT NOT NULL,
       date DATE NOT NULL,
       score INTEGER NOT NULL CHECK(score BETWEEN 1 AND 100),
-      text TEXT DEFAULT ''
+      text TEXT DEFAULT '',
+      iv TEXT,
+      badge TEXT,
+      color TEXT
     );
   `);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_entries_date ON entries(date);`);
@@ -41,9 +43,10 @@ const pool = new Pool({
 const isoDateSchema = z.string().regex(/^\d{4}-\d{2}-\d{2}$/);
 const entrySchema = z.object({
   score: z.number().int().min(1).max(100),
-  text: z.string().max(1000),
-  iv: z.string().max(24),          // IV wird Base64 gespeichert
+  text: z.string().max(1000).optional().default(""),
+  iv: z.string().max(24).optional(),
   badge: z.string().max(50).optional(),
+  color: z.string().optional(),
   date: isoDateSchema.optional()
 });
 
@@ -83,15 +86,16 @@ app.post("/entries", authenticate, async (req, res, next) => {
       text: req.body.text,
       iv: req.body.iv,
       badge: req.body.badge,
+      color: req.body.color,
       date: req.body.date
     });
 
     const date = parsed.date || todayLocalISODate();
 
     const result = await pool.query(
-      `INSERT INTO entries (user_id, date, score, text, iv, badge)
-       VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
-      [req.user_id, date, parsed.score, parsed.text, parsed.iv, parsed.badge || null]
+      `INSERT INTO entries (user_id, date, score, text, iv, badge, color)
+       VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
+      [req.user_id, date, parsed.score, parsed.text, parsed.iv || null, parsed.badge || null, parsed.color || null]
     );
 
     res.json(result.rows[0]);
@@ -155,6 +159,7 @@ app.put("/entries/:id", authenticate, async (req, res, next) => {
       text: req.body.text,
       iv: req.body.iv,
       badge: req.body.badge,
+      color: req.body.color,
       date: req.body.date
     };
 
@@ -164,15 +169,16 @@ app.put("/entries/:id", authenticate, async (req, res, next) => {
     if (payload.score !== undefined) { z.number().int().min(1).max(100).parse(payload.score); fields.push(`score = $${fields.length + 1}`); params.push(payload.score); }
     if (payload.text !== undefined)  { z.string().max(1000).parse(payload.text); fields.push(`text = $${fields.length + 1}`); params.push(payload.text); }
     if (payload.date !== undefined)  { isoDateSchema.parse(payload.date); fields.push(`date = $${fields.length + 1}`); params.push(payload.date); }
-    if (payload.iv !== undefined)   { z.string().max(24).parse(payload.iv); fields.push(`iv = $${fields.length + 1}`); params.push(payload.iv); }
-    if (payload.badge !== undefined){ z.string().max(50).parse(payload.badge); fields.push(`badge = $${fields.length + 1}`); params.push(payload.badge); }
+    if (payload.iv !== undefined)    { z.string().max(24).parse(payload.iv); fields.push(`iv = $${fields.length + 1}`); params.push(payload.iv); }
+    if (payload.badge !== undefined) { z.string().max(50).parse(payload.badge); fields.push(`badge = $${fields.length + 1}`); params.push(payload.badge); }
+    if (payload.color !== undefined) { z.string().parse(payload.color); fields.push(`color = $${fields.length + 1}`); params.push(payload.color); }
 
     if (!fields.length) return res.status(400).json({ error: "No fields to update" });
 
-    params.push(id);
+    params.push(id, req.user_id);
     const result = await pool.query(
       `UPDATE entries SET ${fields.join(", ")} WHERE id = $${fields.length + 1} AND user_id = $${fields.length + 2} RETURNING *`,
-      [...params, req.user_id]
+      params
     );
 
     res.json(result.rows[0]);
