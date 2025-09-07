@@ -13,7 +13,7 @@ app.use(express.json());
 // ---------- Supabase Client (für Auth) ----------
 const supabase = createClient(
   process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY // Service Role Key, um JWT zu prüfen
+  process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
 // ---------- DB ----------
@@ -44,7 +44,7 @@ const isoDateSchema = z.string().regex(/^\d{4}-\d{2}-\d{2}$/);
 const entrySchema = z.object({
   score: z.number().int().min(1).max(100),
   text: z.string().max(1000).optional().default(""),
-  iv: z.string().max(24).optional(),
+  iv: z.string().max(32).optional(),  // Base64 IV max Länge erhöht
   badge: z.string().max(50).optional(),
   color: z.string().optional(),
   date: isoDateSchema.optional()
@@ -54,6 +54,22 @@ function todayLocalISODate() {
   const now = new Date();
   const offMs = now.getTimezoneOffset() * 60000;
   return new Date(now.getTime() - offMs).toISOString().slice(0, 10);
+}
+
+// Score -> Farbe (0=rot, 50=gelb, 100=grün)
+function scoreToColor(score) {
+  score = Math.max(0, Math.min(100, score));
+  let r, g, b = 0;
+  if (score <= 50) {
+    const t = score / 50;
+    r = 255;
+    g = Math.round(255 * t);
+  } else {
+    const t = (score - 50) / 50;
+    r = Math.round(255 * (1 - t));
+    g = 255;
+  }
+  return `rgb(${r},${g},${b})`;
 }
 
 // Middleware: JWT prüfen und user_id setzen
@@ -91,11 +107,12 @@ app.post("/entries", authenticate, async (req, res, next) => {
     });
 
     const date = parsed.date || todayLocalISODate();
+    const color = parsed.color || scoreToColor(parsed.score);
 
     const result = await pool.query(
       `INSERT INTO entries (user_id, date, score, text, iv, badge, color)
        VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
-      [req.user_id, date, parsed.score, parsed.text, parsed.iv || null, parsed.badge || null, parsed.color || null]
+      [req.user_id, date, parsed.score, parsed.text, parsed.iv || null, parsed.badge || null, color]
     );
 
     res.json(result.rows[0]);
@@ -108,7 +125,6 @@ app.post("/entries", authenticate, async (req, res, next) => {
 app.get("/entries", authenticate, async (req, res, next) => {
   try {
     const { from, to, limit } = req.query;
-
     const where = ["user_id = $1"];
     const params = [req.user_id];
 
@@ -163,13 +179,18 @@ app.put("/entries/:id", authenticate, async (req, res, next) => {
       date: req.body.date
     };
 
+    // Automatisch Farbe berechnen, falls Score geändert wird
+    if (payload.score !== undefined && payload.color === undefined) {
+      payload.color = scoreToColor(payload.score);
+    }
+
     const fields = [];
     const params = [];
 
     if (payload.score !== undefined) { z.number().int().min(1).max(100).parse(payload.score); fields.push(`score = $${fields.length + 1}`); params.push(payload.score); }
     if (payload.text !== undefined)  { z.string().max(1000).parse(payload.text); fields.push(`text = $${fields.length + 1}`); params.push(payload.text); }
     if (payload.date !== undefined)  { isoDateSchema.parse(payload.date); fields.push(`date = $${fields.length + 1}`); params.push(payload.date); }
-    if (payload.iv !== undefined)    { z.string().max(24).parse(payload.iv); fields.push(`iv = $${fields.length + 1}`); params.push(payload.iv); }
+    if (payload.iv !== undefined)    { z.string().max(32).parse(payload.iv); fields.push(`iv = $${fields.length + 1}`); params.push(payload.iv); }
     if (payload.badge !== undefined) { z.string().max(50).parse(payload.badge); fields.push(`badge = $${fields.length + 1}`); params.push(payload.badge); }
     if (payload.color !== undefined) { z.string().parse(payload.color); fields.push(`color = $${fields.length + 1}`); params.push(payload.color); }
 
@@ -186,9 +207,6 @@ app.put("/entries/:id", authenticate, async (req, res, next) => {
     next(err);
   }
 });
-
-
-
 
 // Eintrag löschen
 app.delete("/entries/:id", authenticate, async (req, res, next) => {
